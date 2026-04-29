@@ -1,0 +1,93 @@
+name: Fidelity Headless Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Ticker"
+        required: true
+        default: "FBOT"
+      cusip:
+        description: "CUSIP"
+        required: true
+        default: "316092170"
+      daily_timeout:
+        description: "Wait seconds for Daily Holdings Report"
+        required: true
+        default: "180"
+      excel_timeout:
+        description: "Wait seconds for Excel link"
+        required: true
+        default: "90"
+
+jobs:
+  test-fidelity-headless:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      FIDELITY_HEADLESS: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests playwright openpyxl xlrd
+
+      - name: Install Playwright Chromium with Linux deps
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run Fidelity single ticker headless test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TICKER="${{ github.event.inputs.ticker }}"
+          CUSIP="${{ github.event.inputs.cusip }}"
+          DAILY_TIMEOUT="${{ github.event.inputs.daily_timeout }}"
+          EXCEL_TIMEOUT="${{ github.event.inputs.excel_timeout }}"
+
+          URL="https://fundresearch.fidelity.com/prospectus/eproredirect?clientId=Fidelity&applicationId=MFL&securityIdType=CUSIP&critical=N&securityId=${CUSIP}"
+
+          mkdir -p fidelity_out
+
+          python ./download_fidelity_v6_resilient.py \
+            --url "$URL" \
+            --name "$TICKER" \
+            -o "./fidelity_out" \
+            --overwrite \
+            --debug \
+            --daily-timeout "$DAILY_TIMEOUT" \
+            --excel-timeout "$EXCEL_TIMEOUT" \
+            --max-rounds 1 \
+            --round-delay 0
+
+      - name: Show output tree
+        if: always()
+        run: |
+          find fidelity_out -maxdepth 5 -type f -print || true
+          find . -maxdepth 4 -type f \( -name "*.html" -o -name "*.png" -o -name "*.jsonl" -o -name "*.log" \) -print || true
+
+      - name: Upload Fidelity output and debug files
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fidelity-headless-test-output
+          path: |
+            fidelity_out/**
+            **/*debug*
+            **/*.html
+            **/*.png
+            **/*.jsonl
+            **/*.log
+          if-no-files-found: warn
