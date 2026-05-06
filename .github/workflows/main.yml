@@ -1,93 +1,110 @@
-name: Fidelity Headless Test
+name: Backfill iShares Holdings
 
 on:
   workflow_dispatch:
     inputs:
-      ticker:
-        description: "Ticker"
+      start_date:
+        description: "Start date, e.g. 2017-01-01"
         required: true
-        default: "FBOT"
-      cusip:
-        description: "CUSIP"
+        default: "2017-01-01"
+      end_date:
+        description: "End date, e.g. 2017-12-31"
         required: true
-        default: "316092170"
-      daily_timeout:
-        description: "Wait seconds for Daily Holdings Report"
+        default: "2017-12-31"
+      url_file:
+        description: "iShares URL key file in repo"
         required: true
-        default: "180"
-      excel_timeout:
-        description: "Wait seconds for Excel link"
+        default: "ishares_holding_urls.txt"
+      workers:
+        description: "Downloader workers"
         required: true
-        default: "90"
+        default: "2"
+      weekdays_only:
+        description: "Use --weekdays-only"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      cleanup_empty:
+        description: "Run iShares empty-template cleanup after download"
+        required: true
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
 
 jobs:
-  test-fidelity-headless:
+  download:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    env:
-      FIDELITY_HEADLESS: "1"
-      PYTHONUNBUFFERED: "1"
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas requests playwright openpyxl xlrd
-
-      - name: Install Playwright Chromium with Linux deps
-        run: |
-          python -m playwright install --with-deps chromium
-
-      - name: Run Fidelity single ticker headless test
+      - name: Download iShares holdings
+        env:
+          PYTHONUNBUFFERED: "1" # 强制 Python 实时输出日志，避免控制台假死
         shell: bash
         run: |
           set -euo pipefail
 
-          TICKER="${{ github.event.inputs.ticker }}"
-          CUSIP="${{ github.event.inputs.cusip }}"
-          DAILY_TIMEOUT="${{ github.event.inputs.daily_timeout }}"
-          EXCEL_TIMEOUT="${{ github.event.inputs.excel_timeout }}"
+          FLAGS=""
+          if [ "${{ inputs.weekdays_only }}" = "true" ]; then
+            FLAGS="$FLAGS --weekdays-only"
+          fi
 
-          URL="https://fundresearch.fidelity.com/prospectus/eproredirect?clientId=Fidelity&applicationId=MFL&securityIdType=CUSIP&critical=N&securityId=${CUSIP}"
+          # 增加了 -u 参数，并将 print-every 改为 1，方便排查是否被封 IP
+          python -u download_ishares_history.py \
+            --root "$GITHUB_WORKSPACE/out" \
+            --url-file "${{ inputs.url_file }}" \
+            --start "${{ inputs.start_date }}" \
+            --end "${{ inputs.end_date }}" \
+            --workers "${{ inputs.workers }}" \
+            --min-sleep 0.5 \
+            --max-sleep 2.0 \
+            --print-every 1 \
+            $FLAGS
 
-          mkdir -p fidelity_out
-
-          python ./download_fidelity_v6_resilient.py \
-            --url "$URL" \
-            --name "$TICKER" \
-            -o "./fidelity_out" \
-            --overwrite \
-            --debug \
-            --daily-timeout "$DAILY_TIMEOUT" \
-            --excel-timeout "$EXCEL_TIMEOUT" \
-            --max-rounds 1 \
-            --round-delay 0
-
-      - name: Show output tree
-        if: always()
+      - name: Cleanup empty iShares template files
+        if: ${{ always() && inputs.cleanup_empty == 'true' }}
+        shell: bash
         run: |
-          find fidelity_out -maxdepth 5 -type f -print || true
-          find . -maxdepth 4 -type f \( -name "*.html" -o -name "*.png" -o -name "*.jsonl" -o -name "*.log" \) -print || true
+          set -euo pipefail
+          if [ -d "$GITHUB_WORKSPACE/out/data/vendors/ishares/raw" ]; then
+            python cleanup_ishares_empty_files_v2.py \
+              --root "$GITHUB_WORKSPACE/out" \
+              --max-bytes 12288 \
+              --delete
+          else
+            echo "No iShares raw directory found; skip cleanup."
+          fi
 
-      - name: Upload Fidelity output and debug files
-        if: always()
-        uses: actions/upload-artifact@v7
+      - name: Pack result even if previous step failed
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          if [ -d "$GITHUB_WORKSPACE/out/data/vendors/ishares" ]; then
+            cd "$GITHUB_WORKSPACE/out"
+            tar -czf "$GITHUB_WORKSPACE/package/ishares_${{ inputs.start_date }}_${{ inputs.end_date }}.tar.gz" data/vendors/ishares
+          else
+            echo "No downloaded files found." > "$GITHUB_WORKSPACE/package/NO_FILES_DOWNLOADED.txt"
+          fi
+
+      - name: Upload artifact even if previous step failed
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
         with:
-          name: fidelity-headless-test-output
-          path: |
-            fidelity_out/**
-            **/*debug*
-            **/*.html
-            **/*.png
-            **/*.jsonl
-            **/*.log
-          if-no-files-found: warn
+          name: ishares_${{ inputs.start_date }}_${{ inputs.end_date }}
+          path: package/*
+          retention-days: 7
