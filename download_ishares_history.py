@@ -1,644 +1,583 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""
-download_ishares_history.py
+"""
+iShares / BlackRock holdings historical downloader for GitHub Actions.
 
-用途：
-  根据 iShares / BlackRock holdings ajax key URL，批量回填历史持仓 CSV。
+Input link format, one per line:
+    https://www.blackrock.com/...&asOfDate=20260520&component=holdings    IVV
 
-输入文件支持：
-  1) TXT:
-     https://www.ishares.com/us/products/...ajax?fileType=csv&fileName=IVV_holdings&dataType=fund&asOfDate=20260424    IVV
+Output layout:
+    <root>/data/vendors/ishares/raw/YYYYMMDD/TICKER.csv
 
-  2) CSV:
-     由 find_ishares_holding_urls.py 输出，包含 found_url,ticker,status 等列。
-
-下载逻辑：
-  - 读取每个 ticker 的 key URL
-  - 把 URL 里的 asOfDate=YYYYMMDD 替换成目标日期
-  - 请求下载
-  - HTTP 200 且内容不像 HTML -> 保存
-  - 404 / 400 等无数据日期 -> 跳过并记录日志
-  - 已存在文件默认跳过，支持断点续跑
-
-输出目录：
-  <root>/data/vendors/ishares/raw/YYYY-MM-DD/<ticker>_holdings_YYYYMMDD.csv
-
-示例 CMD：
-  cd /d F:\globle
-
-  先测试 4 个 ETF、1 天：
-  python download_ishares_history.py --root F:\zhenghe --url-file F:\globle\ishares_holding_urls.txt --start 2026-04-24 --end 2026-04-24 --tickers IVV IWF IJH IJR --workers 2 --print-every 1
-
-  全量历史回填：
-  python download_ishares_history.py --root F:\zhenghe --url-file F:\globle\ishares_holding_urls.txt --start 2025-01-01 --end 2026-04-24 --workers 3 --min-sleep 0.5 --max-sleep 2.0 --print-every 100
+Notes:
+- File name comes from the ETF ticker/name in the link file.
+- Folder name comes from the strict internal fund-level As Of date.
+- Empty templates / invalid files are deleted by default and written to manifest only.
+- Date mismatches are quarantined by default to avoid polluting the historical raw tree.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import datetime as dt
 import html
-import os
 import random
 import re
+import shutil
 import sys
-import tempfile
 import time
+import traceback
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
-from urllib.request import HTTPCookieProcessor, Request, build_opener
-
+from typing import Dict, Iterable, List, Optional, Tuple
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
+BAD_HTML_MARKERS = ("<html", "<!doctype html", "access denied", "captcha", "akamai")
+VALID_HEADER_HINTS = ("TICKER", "CUSIP", "ISIN", "ASSET CLASS")
 
-@dataclass
-class UrlKey:
+
+@dataclass(frozen=True)
+class Job:
     ticker: str
-    key_url: str
-    product_id: str
-    file_name: str
+    url_template: str
 
 
 @dataclass
 class DownloadResult:
-    date: str
+    requested_date: str
     ticker: str
     status: str
-    http_status: Optional[int]
-    url: str
-    path: str
-    bytes: int
-    message: str
+    http_status: str = ""
+    bytes: int = 0
+    real_asof_date: str = ""
+    output_path: str = ""
+    header_cut_lines: int = 0
+    note: str = ""
 
 
-def parse_date(value: str) -> dt.date:
-    v = value.strip().lower()
-    if v == "today":
-        return dt.date.today()
-    if v == "yesterday":
-        return dt.date.today() - dt.timedelta(days=1)
+def parse_date(value: str) -> date:
+    s = str(value or "").strip()
+    if re.fullmatch(r"\d{8}", s):
+        return datetime.strptime(s, "%Y%m%d").date()
+    if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", s):
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    raise argparse.ArgumentTypeError(f"Invalid date: {value!r}; use YYYY-MM-DD or YYYYMMDD")
 
-    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+
+def parse_asof_text(value: str) -> str:
+    s = str(value or "").strip().replace('"', "").replace(",", " ")
+    s = re.sub(r"\s+", " ", s)
+    if not s:
+        return ""
+
+    formats = [
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+        "%m/%d/%Y", "%m-%d-%Y", "%m.%d.%Y",
+        "%m/%d/%y", "%m-%d-%y", "%m.%d.%y",
+        "%b %d %Y", "%B %d %Y",
+        "%d %b %Y", "%d %B %Y",
+    ]
+    for fmt in formats:
         try:
-            return dt.datetime.strptime(value, fmt).date()
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
-
-    raise ValueError(f"日期格式错误: {value}，请用 YYYY-MM-DD 或 YYYYMMDD")
-
-
-def iter_dates(start: dt.date, end: dt.date, weekdays_only: bool = False):
-    if end < start:
-        raise ValueError("end 不能早于 start")
-
-    current = start
-    while current <= end:
-        if not weekdays_only or current.weekday() < 5:
-            yield current
-        current += dt.timedelta(days=1)
-
-
-def read_text_with_fallback(path: Path) -> str:
-    for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030"):
-        try:
-            return path.read_text(encoding=enc)
-        except UnicodeDecodeError:
-            continue
-    raise UnicodeDecodeError("unknown", b"", 0, 1, f"无法识别编码: {path}")
-
-
-def clean_url(raw: str) -> str:
-    s = html.unescape(raw.strip())
-    s = s.replace("\\/", "/")
-    s = s.replace("\\u0026", "&")
-    s = s.replace("&amp;", "&")
-    return s
-
-
-def extract_product_id(url: str) -> str:
-    m = re.search(r"/products/(\d+)", url)
-    return m.group(1) if m else ""
-
-
-def extract_file_name(url: str) -> str:
-    q = parse_qs(urlparse(url).query, keep_blank_values=True)
-    return q.get("fileName", [""])[0]
-
-
-def extract_ticker_from_url(url: str) -> str:
-    file_name = extract_file_name(url)
-    if file_name:
-        return file_name.replace("_holdings", "").replace("_HOLDINGS", "").upper()
-
-    m = re.search(r"fileName=([A-Za-z0-9]+)_holdings", url, re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-
     return ""
 
 
-def replace_asof_date(url: str, yyyymmdd: str) -> str:
-    u = clean_url(url)
-    parsed = urlparse(u)
-    q = parse_qs(parsed.query, keep_blank_values=True)
-
-    q["asOfDate"] = [yyyymmdd]
-
-    ordered = []
-    for key in ("fileType", "fileName", "dataType", "asOfDate"):
-        if key in q:
-            for val in q[key]:
-                ordered.append((key, val))
-
-    for key, values in q.items():
-        if key in {"fileType", "fileName", "dataType", "asOfDate"}:
-            continue
-        for val in values:
-            ordered.append((key, val))
-
-    new_query = urlencode(ordered, doseq=True)
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+def yyyymmdd(d: date | str) -> str:
+    if isinstance(d, date):
+        return d.strftime("%Y%m%d")
+    parsed = parse_asof_text(d)
+    return parsed.replace("-", "") if parsed else ""
 
 
-def load_txt_url_keys(path: Path) -> list[UrlKey]:
-    text = read_text_with_fallback(path)
-    keys: list[UrlKey] = []
-    seen: set[str] = set()
+def iter_dates(start: date, end: date, weekdays_only: bool) -> Iterable[date]:
+    cur = start
+    while cur <= end:
+        if not weekdays_only or cur.weekday() < 5:
+            yield cur
+        cur += timedelta(days=1)
 
-    for line_no, raw_line in enumerate(text.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line:
+
+def safe_ticker(value: str) -> str:
+    ticker = str(value or "").strip().upper()
+    ticker = ticker.replace("/", "-").replace("\\", "-")
+    ticker = re.sub(r"[^A-Z0-9._\-]+", "_", ticker)
+    ticker = ticker.strip("._-")
+    return ticker or "UNKNOWN"
+
+
+def parse_jobs_file(path: Path) -> List[Job]:
+    jobs: List[Job] = []
+    seen: set[Tuple[str, str]] = set()
+    for line_no, raw in enumerate(path.read_text(encoding="utf-8-sig", errors="ignore").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
 
-        parts = re.split(r"\s+", line)
-        url = ""
-        ticker = ""
-
-        for part in parts:
-            if part.lower().startswith(("http://", "https://")) and ".ajax?" in part:
-                url = clean_url(part)
-                break
-
-        if not url:
+        parts = [p.strip() for p in re.split(r"\s+|,", line) if p.strip()]
+        url = next((p for p in parts if p.startswith(("http://", "https://"))), "")
+        ticker = next((p for p in reversed(parts) if not p.startswith(("http://", "https://"))), "")
+        if not url or not ticker:
+            print(f"WARN: skip bad line {line_no}: {line[:160]}", file=sys.stderr)
             continue
 
-        # 最后一列通常是 ticker
-        if len(parts) >= 2:
-            candidate = parts[-1].strip().upper()
-            if re.fullmatch(r"[A-Z0-9]{1,12}", candidate):
-                ticker = candidate
-
-        if not ticker:
-            ticker = extract_ticker_from_url(url)
-
-        if not ticker:
-            print(f"[WARN] 第 {line_no} 行无法识别 ticker，跳过: {raw_line}")
+        job = Job(ticker=safe_ticker(ticker), url_template=url)
+        key = (job.ticker, job.url_template)
+        if key in seen:
             continue
+        seen.add(key)
+        jobs.append(job)
 
-        if "asOfDate=" not in url:
-            print(f"[WARN] 第 {line_no} 行 URL 没有 asOfDate，仍会尝试补日期: {url}")
-
-        key_id = f"{ticker}|{url}"
-        if key_id in seen:
-            continue
-
-        seen.add(key_id)
-        keys.append(
-            UrlKey(
-                ticker=ticker,
-                key_url=url,
-                product_id=extract_product_id(url),
-                file_name=extract_file_name(url),
-            )
-        )
-
-    return keys
+    return jobs
 
 
-def load_csv_url_keys(path: Path) -> list[UrlKey]:
-    keys: list[UrlKey] = []
-    seen: set[str] = set()
+def set_asof_date(url_template: str, target: date) -> str:
+    ds = target.strftime("%Y%m%d")
+    if re.search(r"([?&]asOfDate=)\d{8}", url_template):
+        return re.sub(r"([?&]asOfDate=)\d{8}", rf"\g<1>{ds}", url_template)
+    sep = "&" if "?" in url_template else "?"
+    return f"{url_template}{sep}asOfDate={ds}"
 
-    for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030"):
+
+def decode_bytes(data: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "latin1"):
         try:
-            f = path.open("r", newline="", encoding=enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        raise UnicodeDecodeError("unknown", b"", 0, 1, f"无法识别编码: {path}")
-
-    with f:
-        reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames or []
-
-        if "found_url" not in fieldnames and "url" not in fieldnames:
-            raise ValueError("CSV 需要包含 found_url 或 url 列")
-
-        for row in reader:
-            url = clean_url(row.get("found_url") or row.get("url") or "")
-            if not url:
-                continue
-
-            status = (row.get("status") or "").lower()
-            if status and status not in ("found", "constructed", "downloaded", "ok"):
-                continue
-
-            ticker = (row.get("ticker") or "").strip().upper()
-            if not ticker:
-                ticker = extract_ticker_from_url(url)
-
-            if not ticker:
-                continue
-
-            key_id = f"{ticker}|{url}"
-            if key_id in seen:
-                continue
-
-            seen.add(key_id)
-            keys.append(
-                UrlKey(
-                    ticker=ticker,
-                    key_url=url,
-                    product_id=row.get("product_id") or extract_product_id(url),
-                    file_name=extract_file_name(url),
-                )
-            )
-
-    return keys
+            return data.decode(enc, errors="ignore")
+        except Exception:
+            pass
+    return data.decode("latin1", errors="ignore")
 
 
-def load_url_keys(path: Path) -> list[UrlKey]:
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        keys = load_csv_url_keys(path)
-    else:
-        keys = load_txt_url_keys(path)
-
-    if not keys:
-        raise ValueError(f"没有从文件中解析到 iShares URL key: {path}")
-
-    # 如果同一个 ticker 有多个 URL，保留第一个
-    deduped: list[UrlKey] = []
-    seen_tickers: set[str] = set()
-    for k in keys:
-        if k.ticker in seen_tickers:
-            continue
-        seen_tickers.add(k.ticker)
-        deduped.append(k)
-
-    return deduped
+def find_header_index(lines: List[str]) -> int:
+    for i, line in enumerate(lines[:80]):
+        upper = line.upper()
+        if (
+            ("TICKER" in upper and ("CUSIP" in upper or "ISIN" in upper or "ASSET CLASS" in upper))
+            or ("ASSET CLASS" in upper and ("CUSIP" in upper or "ISIN" in upper))
+        ):
+            return i
+    return -1
 
 
-def looks_like_html(data: bytes) -> bool:
-    prefix = data[:1024].lstrip().lower()
-    return (
-        prefix.startswith(b"<!doctype html")
-        or prefix.startswith(b"<html")
-        or b"<html" in prefix[:256]
-        or b"access denied" in prefix
-        or b"request rejected" in prefix
-    )
+def sniff_as_of_date_from_lines(lines: List[str]) -> str:
+    """Strict fund-level As Of detector.
 
+    Only scan metadata before the holdings table, so holdings-row columns such as
+    Effective Date / Accrual Date / Maturity Date cannot be mistaken for fund As Of.
+    """
+    if not lines:
+        return ""
 
-def looks_like_csv(data: bytes) -> bool:
-    head = data[:2048].decode("utf-8", errors="ignore").lower()
+    header_idx = find_header_index(lines)
+    scan_lines = lines[:header_idx] if header_idx >= 0 else lines[:15]
+    text_block = " ".join(scan_lines)
+    text_block = html.unescape(text_block).replace('"', " ").replace(",", " ")
+    text_block = re.sub(r"\s+", " ", text_block)
 
-    csv_markers = [
-        "ticker",
-        "name",
-        "sedol",
-        "isin",
-        "market value",
-        "weight",
-        "shares",
-        "holding",
+    patterns = [
+        r"#\s*As\s+of\s+(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})",
+        r"#\s*As\s+of\s+([A-Za-z]{3,9}\s+\d{1,2}\s+\d{4})",
+        r"(?:Fund\s+Holdings\s+as\s+of|Holdings\s+as\s+of|As\s+of)[^\dA-Za-z]*([A-Za-z]{3,9}\s+\d{1,2}\s+\d{4})",
+        r"(?:Fund\s+Holdings\s+as\s+of|Holdings\s+as\s+of|As\s+of)[^\d]*(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})",
+        r"(?:Fund\s+Holdings\s+as\s+of|Holdings\s+as\s+of|As\s+of)[^\d]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2})",
     ]
 
-    return "," in head and any(m in head for m in csv_markers)
+    for pat in patterns:
+        m = re.search(pat, text_block, re.IGNORECASE)
+        if not m:
+            continue
+        parsed = parse_asof_text(m.group(1))
+        if parsed:
+            return parsed
+    return ""
+
+
+def validate_and_clean(data: bytes, min_bytes: int = 1000) -> Tuple[bool, str, str, int, str]:
+    """Return: ok, status, cleaned_text, header_cut_lines, real_asof_date."""
+    size = len(data or b"")
+    if size < min_bytes:
+        return False, "TOO_SMALL", "", 0, ""
+
+    text = decode_bytes(data)
+    low_head = text[:2000].lower()
+    if any(marker in low_head for marker in BAD_HTML_MARKERS):
+        return False, "BAD_HTML_OR_BLOCK_PAGE", "", 0, ""
+
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return False, "EMPTY_READ", "", 0, ""
+
+    head15 = "".join(lines[:15])
+    if 'Fund Holdings as of,"-"' in head15 or "Fund Holdings as of,-" in head15:
+        return False, "EMPTY_TEMPLATE_DASH_DATE", "", 0, ""
+
+    header_idx = find_header_index(lines)
+    if header_idx < 0:
+        return False, "NO_HOLDINGS_HEADER", "", 0, ""
+    if header_idx + 1 >= len(lines):
+        return False, "NO_DATA_AFTER_HEADER", "", header_idx, ""
+
+    # Validate at least one data row with a reasonable number of CSV columns.
+    data_lines = [ln for ln in lines[header_idx + 1: header_idx + 20] if ln.strip()]
+    valid_data_row = False
+    for ln in data_lines:
+        try:
+            row = next(csv.reader([ln]))
+        except Exception:
+            row = ln.split(",")
+        non_empty = [x for x in row if str(x).strip()]
+        if len(row) >= 5 and len(non_empty) >= 2:
+            valid_data_row = True
+            break
+    if not valid_data_row:
+        return False, "NO_VALID_DATA_ROW", "", header_idx, ""
+
+    real_asof = sniff_as_of_date_from_lines(lines)
+    clean_lines = lines[header_idx:]
+    prefix = f"# As of {real_asof}\n" if real_asof else ""
+    cleaned = prefix + "".join(clean_lines)
+    return True, "VALID", cleaned, header_idx, real_asof
+
+
+def fetch_url(url: str, timeout: int) -> Tuple[int, bytes, str]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/csv,application/csv,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+            return status, resp.read(), ""
+    except urllib.error.HTTPError as e:
+        try:
+            data = e.read()
+        except Exception:
+            data = b""
+        return int(e.code), data, f"HTTPError {e.code}"
+    except Exception as e:
+        return 0, b"", f"{type(e).__name__}: {str(e)[:180]}"
+
+
+def atomic_write_text(path: Path, text: str, overwrite: bool) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not overwrite:
+        return False
+    tmp = path.with_suffix(path.suffix + f".tmp_{random.randint(100000, 999999)}")
+    tmp.write_text(text, encoding="utf-8-sig", newline="")
+    if path.exists() and overwrite:
+        path.unlink(missing_ok=True)
+    shutil.move(str(tmp), str(path))
+    return True
+
+
+def save_bad_sample(raw_root: Path, requested: str, ticker: str, status: str, data: bytes, overwrite: bool) -> str:
+    bad_dir = raw_root / "_bad" / requested
+    bad_dir.mkdir(parents=True, exist_ok=True)
+    safe_status = re.sub(r"[^A-Z0-9_\-]+", "_", status.upper())
+    path = bad_dir / f"{ticker}_{safe_status}.bin"
+    if path.exists() and not overwrite:
+        return str(path)
+    path.write_bytes(data)
+    return str(path)
 
 
 def download_one(
-    *,
-    root: Path,
-    vendor: str,
-    key: UrlKey,
-    date_obj: dt.date,
-    timeout: int,
-    retries: int,
+    job: Job,
+    target_date: date,
+    raw_root: Path,
     overwrite: bool,
-    dry_run: bool,
     min_sleep: float,
     max_sleep: float,
+    timeout: int,
+    max_retries: int,
+    min_bytes: int,
+    keep_bad: bool,
+    allow_date_mismatch: bool,
+    allow_undated: bool,
 ) -> DownloadResult:
-    yyyymmdd = date_obj.strftime("%Y%m%d")
-    date_dash = date_obj.strftime("%Y-%m-%d")
-    url = replace_asof_date(key.key_url, yyyymmdd)
+    requested = target_date.strftime("%Y-%m-%d")
+    requested_dir = target_date.strftime("%Y%m%d")
+    ticker = job.ticker
 
-    out_dir = root / "data" / "vendors" / vendor / "raw" / date_dash
-    out_file = out_dir / f"{key.ticker.lower()}_holdings_{yyyymmdd}.csv"
-
-    if out_file.exists() and out_file.stat().st_size > 0 and not overwrite:
+    expected_path = raw_root / requested_dir / f"{ticker}.csv"
+    if expected_path.exists() and not overwrite:
         return DownloadResult(
-            date=date_dash,
-            ticker=key.ticker,
-            status="exists",
-            http_status=None,
-            url=url,
-            path=str(out_file),
-            bytes=out_file.stat().st_size,
-            message="skip existing file",
+            requested_date=requested,
+            ticker=ticker,
+            status="EXISTS",
+            output_path=str(expected_path),
+            note="target file already exists",
         )
 
-    if dry_run:
-        return DownloadResult(
-            date=date_dash,
-            ticker=key.ticker,
-            status="dry_run",
-            http_status=None,
-            url=url,
-            path=str(out_file),
-            bytes=0,
-            message="dry run only",
-        )
+    url = set_asof_date(job.url_template, target_date)
+    last_status = ""
+    last_http = ""
+    last_bytes = 0
+    last_note = ""
+    last_data = b""
 
-    if max_sleep > 0:
-        time.sleep(random.uniform(min_sleep, max_sleep))
+    for attempt in range(max_retries + 1):
+        if max_sleep > 0:
+            time.sleep(random.uniform(max(0.0, min_sleep), max(0.0, max_sleep)))
 
-    opener = build_opener(HTTPCookieProcessor())
-    last_message = ""
+        http_status, data, err = fetch_url(url, timeout=timeout)
+        last_http = str(http_status) if http_status else "ERR"
+        last_bytes = len(data or b"")
+        last_data = data or b""
 
-    for attempt in range(retries + 1):
-        try:
-            req = Request(
-                url,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "text/csv,application/csv,text/plain,*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": key.key_url.split(".ajax?")[0] if ".ajax?" in key.key_url else "https://www.ishares.com/",
-                    "Connection": "close",
-                },
-                method="GET",
-            )
+        if http_status != 200:
+            last_status = f"HTTP_{http_status}" if http_status else "REQUEST_ERROR"
+            last_note = err
+            if http_status in (0, 429, 500, 502, 503, 504) and attempt < max_retries:
+                time.sleep(1.5 + attempt * 2.0 + random.uniform(0.0, 1.0))
+                continue
+            break
 
-            with opener.open(req, timeout=timeout) as resp:
-                http_status = getattr(resp, "status", None) or resp.getcode()
-                data = resp.read()
+        ok, status, cleaned, cut_lines, real_asof = validate_and_clean(data, min_bytes=min_bytes)
+        if not ok:
+            last_status = status
+            last_note = "invalid or empty holdings file deleted"
+            if status in ("BAD_HTML_OR_BLOCK_PAGE",) and attempt < max_retries:
+                time.sleep(2.0 + attempt * 2.0 + random.uniform(0.0, 2.0))
+                continue
+            break
 
-            if http_status == 200:
-                if not data:
-                    return DownloadResult(date_dash, key.ticker, "empty", http_status, url, str(out_file), 0, "200 but empty body")
+        # Valid file: route by strict internal As Of date.
+        if real_asof:
+            real_dir = real_asof.replace("-", "")
+            if real_dir != requested_dir and not allow_date_mismatch:
+                out_path = raw_root / "_date_mismatch" / f"requested_{requested_dir}" / f"asof_{real_dir}" / f"{ticker}.csv"
+                written = atomic_write_text(out_path, cleaned, overwrite=overwrite)
+                return DownloadResult(
+                    requested_date=requested,
+                    ticker=ticker,
+                    status="DATE_MISMATCH_QUARANTINED" if written else "DATE_MISMATCH_EXISTS",
+                    http_status=last_http,
+                    bytes=last_bytes,
+                    real_asof_date=real_asof,
+                    output_path=str(out_path),
+                    header_cut_lines=cut_lines,
+                    note=f"requested {requested_dir}, internal as-of {real_dir}",
+                )
 
-                if looks_like_html(data):
-                    return DownloadResult(date_dash, key.ticker, "bad_content", http_status, url, str(out_file), len(data), "200 but body looks like html/access denied")
-
-                if not looks_like_csv(data):
-                    # 不直接丢弃，先标记为 suspicious 但仍保存，便于人工检查
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    fd, tmp_name = tempfile.mkstemp(prefix=out_file.name + ".", suffix=".tmp", dir=str(out_dir))
-                    try:
-                        with os.fdopen(fd, "wb") as f:
-                            f.write(data)
-                        os.replace(tmp_name, out_file)
-                    finally:
-                        if os.path.exists(tmp_name):
-                            os.remove(tmp_name)
-
-                    return DownloadResult(date_dash, key.ticker, "suspicious_saved", http_status, url, str(out_file), len(data), "saved but csv markers not obvious")
-
-                out_dir.mkdir(parents=True, exist_ok=True)
-                fd, tmp_name = tempfile.mkstemp(prefix=out_file.name + ".", suffix=".tmp", dir=str(out_dir))
-
-                try:
-                    with os.fdopen(fd, "wb") as f:
-                        f.write(data)
-                    os.replace(tmp_name, out_file)
-                finally:
-                    if os.path.exists(tmp_name):
-                        os.remove(tmp_name)
-
-                return DownloadResult(date_dash, key.ticker, "downloaded", http_status, url, str(out_file), len(data), "ok")
-
+            final_dir = real_dir
+            out_path = raw_root / final_dir / f"{ticker}.csv"
+            written = atomic_write_text(out_path, cleaned, overwrite=overwrite)
             return DownloadResult(
-                date_dash,
-                key.ticker,
-                "http_other",
-                http_status,
-                url,
-                str(out_file),
-                0,
-                f"unexpected http status: {http_status}",
+                requested_date=requested,
+                ticker=ticker,
+                status="OK" if written else "EXISTS",
+                http_status=last_http,
+                bytes=last_bytes,
+                real_asof_date=real_asof,
+                output_path=str(out_path),
+                header_cut_lines=cut_lines,
+                note="saved by internal as-of date",
             )
 
-        except HTTPError as exc:
-            # iShares 有时无数据可能是 400/404，均视为无文件日期
-            if exc.code in (400, 404):
-                return DownloadResult(date_dash, key.ticker, "not_found", exc.code, url, str(out_file), 0, f"HTTP {exc.code}")
+        if not allow_undated:
+            out_path = raw_root / "_undated" / f"requested_{requested_dir}" / f"{ticker}.csv"
+            written = atomic_write_text(out_path, cleaned, overwrite=overwrite)
+            return DownloadResult(
+                requested_date=requested,
+                ticker=ticker,
+                status="UNDATED_QUARANTINED" if written else "UNDATED_EXISTS",
+                http_status=last_http,
+                bytes=last_bytes,
+                output_path=str(out_path),
+                header_cut_lines=cut_lines,
+                note="valid holdings body but no strict fund-level as-of date found",
+            )
 
-            last_message = f"HTTPError {exc.code}: {exc.reason}"
+        out_path = raw_root / requested_dir / f"{ticker}.csv"
+        written = atomic_write_text(out_path, cleaned, overwrite=overwrite)
+        return DownloadResult(
+            requested_date=requested,
+            ticker=ticker,
+            status="OK_UNDATED" if written else "EXISTS",
+            http_status=last_http,
+            bytes=last_bytes,
+            output_path=str(out_path),
+            header_cut_lines=cut_lines,
+            note="saved by requested date because --allow-undated was enabled",
+        )
 
-            if exc.code in (403, 429, 500, 502, 503, 504) and attempt < retries:
-                time.sleep(2.0 * (attempt + 1))
-                continue
+    output_path = ""
+    if keep_bad and last_data:
+        output_path = save_bad_sample(raw_root, requested_dir, ticker, last_status or "BAD", last_data, overwrite=overwrite)
 
-            return DownloadResult(date_dash, key.ticker, "http_error", exc.code, url, str(out_file), 0, last_message)
-
-        except (URLError, TimeoutError, ConnectionError) as exc:
-            last_message = repr(exc)
-            if attempt < retries:
-                time.sleep(2.0 * (attempt + 1))
-                continue
-
-            return DownloadResult(date_dash, key.ticker, "network_error", None, url, str(out_file), 0, last_message)
-
-        except Exception as exc:
-            return DownloadResult(date_dash, key.ticker, "error", None, url, str(out_file), 0, repr(exc))
-
-    return DownloadResult(date_dash, key.ticker, "failed", None, url, str(out_file), 0, last_message or "failed after retries")
+    return DownloadResult(
+        requested_date=requested,
+        ticker=ticker,
+        status=last_status or "FAILED",
+        http_status=last_http,
+        bytes=last_bytes,
+        output_path=output_path,
+        note=last_note,
+    )
 
 
-def write_log(log_path: Path, rows: list[DownloadResult]) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    fields = [
-        "date",
-        "ticker",
-        "status",
-        "http_status",
-        "url",
-        "path",
-        "bytes",
-        "message",
-        "logged_at",
+def append_manifest(path: Path, rows: List[DownloadResult]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    fieldnames = [
+        "requested_date", "ticker", "status", "http_status", "bytes",
+        "real_asof_date", "output_path", "header_cut_lines", "note",
     ]
-
-    with log_path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        now = dt.datetime.now().isoformat(timespec="seconds")
-
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
         for r in rows:
-            writer.writerow(
-                {
-                    "date": r.date,
-                    "ticker": r.ticker,
-                    "status": r.status,
-                    "http_status": r.http_status if r.http_status is not None else "",
-                    "url": r.url,
-                    "path": r.path,
-                    "bytes": r.bytes,
-                    "message": r.message,
-                    "logged_at": now,
-                }
-            )
+            writer.writerow({k: getattr(r, k) for k in fieldnames})
+
+
+def summarize(rows: List[DownloadResult]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for r in rows:
+        out[r.status] = out.get(r.status, 0) + 1
+    return out
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Download iShares historical holdings CSV files.")
-    parser.add_argument("--root", default=r"F:\zhenghe", help="项目根目录，例如 F:\\zhenghe")
-    parser.add_argument("--vendor", default="ishares", help="vendor 名称，默认 ishares")
-    parser.add_argument("--url-file", required=True, help="包含 iShares key URL + ticker 的 txt，或 URL finder 输出 CSV")
-    parser.add_argument("--start", default="2025-01-01", help="开始日期 YYYY-MM-DD / YYYYMMDD")
-    parser.add_argument("--end", default="yesterday", help="结束日期 YYYY-MM-DD / YYYYMMDD / today / yesterday")
-    parser.add_argument("--workers", type=int, default=3, help="并发下载线程数，建议 1-3")
-    parser.add_argument("--timeout", type=int, default=35, help="单请求超时秒数")
-    parser.add_argument("--retries", type=int, default=2, help="网络错误 / 429 / 5xx 重试次数")
-    parser.add_argument("--overwrite", action="store_true", help="覆盖已存在文件")
-    parser.add_argument("--dry-run", action="store_true", help="只打印计划，不下载")
-    parser.add_argument("--weekdays-only", action="store_true", help="只尝试周一到周五，减少周末无数据请求")
-    parser.add_argument("--tickers", nargs="*", default=None, help="只下载指定 ticker，用于测试，例如 --tickers IVV IWF")
-    parser.add_argument("--min-sleep", type=float, default=0.5, help="每个请求前最小随机等待秒数")
-    parser.add_argument("--max-sleep", type=float, default=2.0, help="每个请求前最大随机等待秒数")
-    parser.add_argument("--print-every", type=int, default=100, help="每处理多少个任务打印一次进度")
-
+    parser = argparse.ArgumentParser(description="Backfill iShares / BlackRock holdings history by date range")
+    parser.add_argument("--root", required=True, help="Output package root. Raw files go under root/data/vendors/ishares/raw")
+    parser.add_argument("--url-file", required=True, help="Link file: URL + ETF ticker per line")
+    parser.add_argument("--start", required=True, type=parse_date, help="Start date, YYYY-MM-DD or YYYYMMDD")
+    parser.add_argument("--end", required=True, type=parse_date, help="End date, YYYY-MM-DD or YYYYMMDD")
+    parser.add_argument("--workers", type=int, default=6, help="Concurrent downloader workers")
+    parser.add_argument("--min-sleep", type=float, default=0.5, help="Random sleep lower bound before each request")
+    parser.add_argument("--max-sleep", type=float, default=2.0, help="Random sleep upper bound before each request")
+    parser.add_argument("--print-every", type=int, default=25, help="Print progress every N completed tasks")
+    parser.add_argument("--weekdays-only", action="store_true", help="Skip Saturdays and Sundays")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing raw files")
+    parser.add_argument("--timeout", type=int, default=45, help="HTTP timeout seconds")
+    parser.add_argument("--max-retries", type=int, default=2, help="Retries for transient HTTP/network failures")
+    parser.add_argument("--min-bytes", type=int, default=1000, help="Minimum bytes for a valid holdings CSV candidate")
+    parser.add_argument("--keep-bad", action="store_true", help="Keep invalid/empty/block-page samples under raw/_bad")
+    parser.add_argument("--allow-date-mismatch", action="store_true", help="Save valid files even if internal As Of differs from requested date")
+    parser.add_argument("--allow-undated", action="store_true", help="Save valid files with no strict As Of under the requested date")
     args = parser.parse_args()
 
-    root = Path(args.root)
-    vendor = args.vendor.strip().lower()
+    if args.end < args.start:
+        raise SystemExit("--end must be >= --start")
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1")
+
+    root = Path(args.root).resolve()
     url_file = Path(args.url_file)
+    if not url_file.is_absolute():
+        url_file = Path.cwd() / url_file
+    url_file = url_file.resolve()
+    if not url_file.exists():
+        raise SystemExit(f"URL file not found: {url_file}")
 
-    start = parse_date(args.start)
-    end = parse_date(args.end)
+    raw_root = root / "data" / "vendors" / "ishares" / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    manifest = root / "data" / "vendors" / "ishares" / "download_manifest.csv"
 
-    keys = load_url_keys(url_file)
+    jobs = parse_jobs_file(url_file)
+    dates = list(iter_dates(args.start, args.end, weekdays_only=args.weekdays_only))
+    total = len(jobs) * len(dates)
 
-    if args.tickers:
-        requested = {x.upper() for x in args.tickers}
-        keys = [k for k in keys if k.ticker.upper() in requested]
-        missing = sorted(requested - {k.ticker.upper() for k in keys})
-        if missing:
-            print(f"[WARN] url-file 中没找到这些 ticker: {missing}")
+    print("=" * 100, flush=True)
+    print("BACKFILL iSHARES HOLDINGS HISTORY", flush=True)
+    print("=" * 100, flush=True)
+    print(f"ROOT          : {root}", flush=True)
+    print(f"RAW ROOT      : {raw_root}", flush=True)
+    print(f"URL FILE      : {url_file}", flush=True)
+    print(f"DATE RANGE    : {args.start} -> {args.end}", flush=True)
+    print(f"WEEKDAYS ONLY : {args.weekdays_only}", flush=True)
+    print(f"DATES         : {len(dates)}", flush=True)
+    print(f"JOBS          : {len(jobs)}", flush=True)
+    print(f"TOTAL TASKS   : {total}", flush=True)
+    print(f"WORKERS       : {args.workers}", flush=True)
+    print(f"MANIFEST      : {manifest}", flush=True)
+    print("=" * 100, flush=True)
 
-    if not keys:
-        print("[ERROR] URL key 列表为空")
-        return 2
+    if not jobs:
+        raise SystemExit("No jobs parsed from URL file")
+    if not dates:
+        raise SystemExit("No dates to download")
 
-    dates = list(iter_dates(start, end, weekdays_only=args.weekdays_only))
-    total_tasks = len(keys) * len(dates)
+    done = 0
+    all_counts: Dict[str, int] = {}
+    started = time.time()
 
-    print("========================================")
-    print("iShares holdings history downloader")
-    print("========================================")
-    print(f"root        : {root}")
-    print(f"vendor      : {vendor}")
-    print(f"url_file    : {url_file}")
-    print(f"tickers     : {len(keys)}")
-    print(f"date range  : {start} -> {end}")
-    print(f"dates       : {len(dates)}")
-    print(f"tasks       : {total_tasks}")
-    print(f"workers     : {args.workers}")
-    print(f"dry_run     : {args.dry_run}")
-    print(f"weekdays_only: {args.weekdays_only}")
-    print("========================================")
-
-    if total_tasks == 0:
-        print("[ERROR] 没有任务")
-        return 2
-
-    results: list[DownloadResult] = []
-    counters: dict[str, int] = {}
-
-    processed = 0
-
-    def submit_tasks(executor: ThreadPoolExecutor):
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
         for d in dates:
-            for key in keys:
-                yield executor.submit(
+            date_label = d.strftime("%Y-%m-%d")
+            print(f"\n▶ DATE {date_label} | tasks={len(jobs)}", flush=True)
+            futures = [
+                ex.submit(
                     download_one,
-                    root=root,
-                    vendor=vendor,
-                    key=key,
-                    date_obj=d,
-                    timeout=args.timeout,
-                    retries=args.retries,
-                    overwrite=args.overwrite,
-                    dry_run=args.dry_run,
-                    min_sleep=args.min_sleep,
-                    max_sleep=args.max_sleep,
+                    job,
+                    d,
+                    raw_root,
+                    args.overwrite,
+                    args.min_sleep,
+                    args.max_sleep,
+                    args.timeout,
+                    args.max_retries,
+                    args.min_bytes,
+                    args.keep_bad,
+                    args.allow_date_mismatch,
+                    args.allow_undated,
                 )
+                for job in jobs
+            ]
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = list(submit_tasks(executor))
+            batch_rows: List[DownloadResult] = []
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    r = DownloadResult(
+                        requested_date=date_label,
+                        ticker="UNKNOWN",
+                        status="WORKER_EXCEPTION",
+                        note=f"{type(e).__name__}: {str(e)[:180]} | {traceback.format_exc(limit=1).strip()}",
+                    )
+                batch_rows.append(r)
+                done += 1
+                all_counts[r.status] = all_counts.get(r.status, 0) + 1
+                if args.print_every > 0 and (done % args.print_every == 0 or done == total):
+                    elapsed = time.time() - started
+                    rate = done / elapsed if elapsed > 0 else 0.0
+                    print(
+                        f"  progress {done}/{total} | {rate:.2f} tasks/s | "
+                        f"{r.ticker} {r.requested_date} {r.status} {r.http_status}",
+                        flush=True,
+                    )
 
-        for fut in as_completed(futures):
-            r = fut.result()
-            results.append(r)
-            counters[r.status] = counters.get(r.status, 0) + 1
-            processed += 1
+            append_manifest(manifest, batch_rows)
+            day_counts = summarize(batch_rows)
+            print("  DAY SUMMARY: " + ", ".join(f"{k}={v}" for k, v in sorted(day_counts.items())), flush=True)
 
-            if processed % args.print_every == 0 or processed == total_tasks:
-                downloaded = counters.get("downloaded", 0)
-                exists = counters.get("exists", 0)
-                not_found = counters.get("not_found", 0)
-                suspicious = counters.get("suspicious_saved", 0)
-                errors = sum(
-                    v
-                    for k, v in counters.items()
-                    if k not in ("downloaded", "exists", "not_found", "dry_run", "suspicious_saved")
-                )
-                print(
-                    f"[{processed}/{total_tasks}] "
-                    f"downloaded={downloaded}, exists={exists}, "
-                    f"404/400={not_found}, suspicious={suspicious}, errors={errors}"
-                )
-
-    start_s = start.strftime("%Y%m%d")
-    end_s = end.strftime("%Y%m%d")
-    log_path = (
-        root
-        / "data"
-        / "vendors"
-        / vendor
-        / "history"
-        / f"download_log_{vendor}_{start_s}_{end_s}.csv"
-    )
-    write_log(log_path, results)
-
-    print("\n========== SUMMARY ==========")
-    for k in sorted(counters):
-        print(f"{k:18s}: {counters[k]}")
-    print(f"log: {log_path}")
-    print("=============================")
-
-    hard_errors = sum(
-        v
-        for k, v in counters.items()
-        if k not in ("downloaded", "exists", "not_found", "dry_run", "suspicious_saved")
-    )
-
-    return 1 if hard_errors else 0
+    print("\n" + "=" * 100, flush=True)
+    print("BACKFILL COMPLETE", flush=True)
+    print("=" * 100, flush=True)
+    for k, v in sorted(all_counts.items()):
+        print(f"{k:28s} {v}", flush=True)
+    print(f"MANIFEST: {manifest}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
