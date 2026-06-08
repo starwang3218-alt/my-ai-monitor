@@ -18,7 +18,7 @@ on:
       workers:
         description: "Downloader workers"
         required: true
-        default: "20"
+        default: "6"
       weekdays_only:
         description: "Use --weekdays-only"
         required: true
@@ -71,7 +71,7 @@ jobs:
             --workers "${{ inputs.workers }}" \
             --min-sleep 0.5 \
             --max-sleep 2.0 \
-            --print-every 1 \
+            --print-every 25 \
             $FLAGS
 
       - name: Cleanup empty iShares template files
@@ -79,7 +79,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d "$GITHUB_WORKSPACE/out/data/vendors/ishares/raw" ]; then
+          if [ ! -f cleanup_ishares_empty_files_v2.py ]; then
+            echo "cleanup_ishares_empty_files_v2.py not found; skip cleanup."
+          elif [ -d "$GITHUB_WORKSPACE/out/data/vendors/ishares/raw" ]; then
             python cleanup_ishares_empty_files_v2.py \
               --root "$GITHUB_WORKSPACE/out" \
               --max-bytes 12288 \
